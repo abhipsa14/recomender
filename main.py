@@ -1,572 +1,426 @@
-from abc import ABC, abstractmethod
-import requests
-from bs4 import BeautifulSoup
-import time
-import json
-import re
-from urllib.parse import urljoin, urlparse
-from datetime import datetime, timedelta
-import dateutil.parser
+#!/usr/bin/env python3
+"""
+Job Scraper Project - Main Entry Point
+Orchestrates job scraping from multiple sources with filtering and export capabilities.
+"""
 
-def parse_posting_date(date_str):
-    """Parse various date formats and return datetime object"""
-    if not date_str or date_str == 'N/A':
-        return None
-    
-    # Clean the date string
-    date_str = date_str.strip().lower()
-    now = datetime.now()
-    
-    # Handle relative dates (e.g., "2 days ago", "1 hour ago")
-    if 'ago' in date_str:
-        if 'hour' in date_str:
-            hours = re.search(r'(\d+)', date_str)
-            if hours:
-                return now - timedelta(hours=int(hours.group(1)))
-        elif 'day' in date_str:
-            days = re.search(r'(\d+)', date_str)
-            if days:
-                return now - timedelta(days=int(days.group(1)))
-        elif 'week' in date_str:
-            weeks = re.search(r'(\d+)', date_str)
-            if weeks:
-                return now - timedelta(weeks=int(weeks.group(1)))
-        elif 'month' in date_str:
-            months = re.search(r'(\d+)', date_str)
-            if months:
-                return now - timedelta(days=int(months.group(1)) * 30)
-    
-    # Handle "today" and "yesterday"
-    if 'today' in date_str:
-        return now
-    elif 'yesterday' in date_str:
-        return now - timedelta(days=1)
-    
-    # Try to parse absolute dates
+import logging
+import argparse
+import yaml
+import sys
+import os
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Any
+
+# Add current directory to Python path for imports
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from manager.scraper_manager import ScraperManager
+    from filters.job_filter import MainJobFilter, deduplicate_jobs
+    from utils.exporter import CSVExporter, JSONExporter, ExcelExporter  # Fixed import
+    from utils.logger import setup_logger
+    # Email sender commented out as it's not implemented yet
+    # from utils.emailer import EmailSender
+except ImportError as e:
+    print(f"❌ Import error: {e}")
+    print("Please ensure all required modules are in place.")
+    sys.exit(1)
+
+
+def load_config(config_path: str = "configs/settings.yaml") -> dict:
+    """Load configuration from YAML file"""
     try:
-        return dateutil.parser.parse(date_str)
-    except:
-        pass
-    
-    return None
+        with open(config_path, 'r') as file:
+            config = yaml.safe_load(file)
+            print(f"✅ Configuration loaded from {config_path}")
+            return config
+    except FileNotFoundError:
+        print(f"⚠️  Config file {config_path} not found. Using default settings.")
+        return get_default_config()
+    except yaml.YAMLError as e:
+        print(f"❌ Error reading config file: {e}. Using default settings.")
+        return get_default_config()
 
-def is_within_time_filter(posted_date, hours_limit=36):
-    """Check if job was posted within the specified hours"""
-    if not posted_date:
+
+def get_default_config() -> dict:
+    """Get default configuration"""
+    return {
+        'search': {
+            'terms': ['Python Developer', 'Data Scientist'],
+            'locations': ['San Francisco', 'New York'],
+            'pages_per_source': 2
+        },
+        'scrapers': {
+            'enabled': ['linkedin', 'indeed', 'google'],
+            'parallel': True,
+            'max_workers': 3,
+            'delay': 2.0
+        },
+        'filters': {
+            'min_salary': None,
+            'max_salary': None,
+            'experience_levels': ['entry', 'mid', 'senior'],
+            'exclude_companies': [],
+            'include_companies': [],
+            'keywords': ['python', 'programming'],
+            'exclude_keywords': ['sales', 'marketing'],
+            'max_age_days': 30,
+            'remote_only': False,
+            'full_time_only': False
+        },
+        'output': {
+            'format': 'csv',
+            'filename': 'jobs_{timestamp}.csv',
+            'include_duplicates': False,
+            'sort_by': 'posted_date',
+            'sort_order': 'desc'
+        },
+        'email': {
+            'enabled': False,
+            'recipient': 'your-email@example.com',
+            'sender': 'scraper@example.com',
+            'sender_password': 'your-app-password',
+            'smtp_server': 'smtp.gmail.com',
+            'smtp_port': 587,
+            'subject_template': 'Job Alert: {job_count} new jobs found',
+            'include_attachments': True,
+            'max_jobs_in_email': 20
+        },
+        'logging': {
+            'level': 'INFO',
+            'file': 'logs/scraper.log'
+        }
+    }
+
+
+def ensure_directories_exist():
+    """Create necessary directories if they don't exist"""
+    directories = ['logs', 'data', 'data/output']
+    for directory in directories:
+        Path(directory).mkdir(parents=True, exist_ok=True)
+
+
+def validate_config(config: dict) -> bool:
+    """Validate configuration structure"""
+    required_sections = ['search', 'scrapers', 'filters', 'output']
+    
+    for section in required_sections:
+        if section not in config:
+            print(f"❌ Missing required config section: {section}")
+            return False
+    
+    # Validate search terms
+    if not config['search'].get('terms'):
+        print("❌ No search terms specified")
         return False
     
-    now = datetime.now()
-    time_diff = now - posted_date
-    return time_diff.total_seconds() / 3600 <= hours_limit
+    # Validate locations
+    if not config['search'].get('locations'):
+        print("❌ No locations specified")
+        return False
+    
+    # Validate enabled scrapers
+    if not config['scrapers'].get('enabled'):
+        print("❌ No scrapers enabled")
+        return False
+    
+    return True
 
-def filter_by_company(jobs, include_companies=None, exclude_companies=None):
-    """Filter jobs by company names"""
-    if not include_companies and not exclude_companies:
-        return jobs
-    
-    filtered_jobs = []
-    
-    for job in jobs:
-        company_name = job.get('company', '').lower().strip()
-        
-        # Check exclude list first
-        if exclude_companies:
-            exclude_list = [comp.lower().strip() for comp in exclude_companies]
-            if any(excluded in company_name for excluded in exclude_list):
-                continue
-        
-        # Check include list
-        if include_companies:
-            include_list = [comp.lower().strip() for comp in include_companies]
-            if not any(included in company_name for included in include_list):
-                continue
-        
-        filtered_jobs.append(job)
-    
-    return filtered_jobs
 
-def detect_experience_level(job_title, company=""):
-    """Detect experience level from job title and company"""
-    title_lower = job_title.lower()
-    company_lower = company.lower()
+def display_config_summary(config: dict):
+    """Display configuration summary"""
+    print("\n📋 Configuration Summary:")
+    print("=" * 50)
+    print(f"🔍 Search Terms: {', '.join(config['search']['terms'][:3])}")
+    if len(config['search']['terms']) > 3:
+        print(f"    ... and {len(config['search']['terms']) - 3} more")
     
-    # Entry level keywords
-    entry_keywords = [
-        'junior', 'trainee', 'intern', 'entry', 'graduate', 'fresher', 
-        'associate', 'beginner', 'apprentice', '0-1 year', '0-2 year',
-        'new grad', 'recent graduate'
-    ]
+    print(f"📍 Locations: {', '.join(config['search']['locations'][:3])}")
+    if len(config['search']['locations']) > 3:
+        print(f"    ... and {len(config['search']['locations']) - 3} more")
     
-    # Mid level keywords
-    mid_keywords = [
-        'mid', 'intermediate', 'regular', '2-5 year', '3-6 year',
-        'experienced', 'specialist'
-    ]
-    
-    # Senior level keywords
-    senior_keywords = [
-        'senior', 'sr.', 'lead', 'principal', 'architect', 'manager',
-        'head', 'director', 'chief', 'expert', '5+ year', '7+ year',
-        'team lead', 'tech lead', 'technical lead'
-    ]
-    
-    # Check for entry level
-    if any(keyword in title_lower for keyword in entry_keywords):
-        return 'entry'
-    
-    # Check for senior level
-    if any(keyword in title_lower for keyword in senior_keywords):
-        return 'senior'
-    
-    # Check for mid level
-    if any(keyword in title_lower for keyword in mid_keywords):
-        return 'mid'
-    
-    # Default to mid if no clear indicators
-    return 'mid'
+    print(f"🌐 Scrapers: {', '.join(config['scrapers']['enabled'])}")
+    print(f"📄 Pages per source: {config['search']['pages_per_source']}")
+    print(f"📊 Output format: {config['output']['format']}")
+    print(f"📧 Email enabled: {'Yes' if config['email']['enabled'] else 'No'}")
+    print("=" * 50)
 
-def filter_by_experience(jobs, experience_levels=None):
-    """Filter jobs by experience level"""
-    if not experience_levels:
-        return jobs
-    
-    filtered_jobs = []
-    
-    for job in jobs:
-        # Detect experience level for this job
-        job_experience = detect_experience_level(job.get('title', ''), job.get('company', ''))
-        job['experience_level'] = job_experience
-        
-        # Check if this job matches the desired experience levels
-        if job_experience in experience_levels:
-            filtered_jobs.append(job)
-    
-    return filtered_jobs
 
-class JobScraper(ABC):
-    """Abstract base class for job scrapers"""
-    
-    def __init__(self):
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-        }
-    
-    @abstractmethod
-    def build_search_url(self, search_term, location, page=0):
-        """Build search URL for the job site"""
-        pass
-    
-    @abstractmethod
-    def extract_job_cards(self, soup):
-        """Extract job card elements from the page"""
-        pass
-    
-    @abstractmethod
-    def extract_job_info(self, job_card):
-        """Extract job information from a job card"""
-        pass
-    
-    def scrape_jobs(self, search_term="", location="", num_pages=1, use_time_filter=False, hours_limit=36):
-        """Generic scraping method with optional time filtering"""
-        jobs_data = []
-        filtered_count = 0
-        
-        for page in range(num_pages):
-            try:
-                url = self.build_search_url(search_term, location, page)
-                response = requests.get(url, headers=self.headers, timeout=10)
-                response.raise_for_status()
-                
-                soup = BeautifulSoup(response.text, 'lxml')
-                job_cards = self.extract_job_cards(soup)
-                
-                print(f"Found {len(job_cards)} job cards on page {page + 1} from {self.__class__.__name__}")
-                
-                for card in job_cards:
-                    job_info = self.extract_job_info(card)
-                    if job_info:
-                        job_info['source'] = self.__class__.__name__.replace('Scraper', '')
-                        
-                        # Apply time filter if enabled
-                        if use_time_filter:
-                            posted_date = parse_posting_date(job_info.get('posted_date', ''))
-                            if posted_date and is_within_time_filter(posted_date, hours_limit):
-                                jobs_data.append(job_info)
-                            else:
-                                filtered_count += 1
-                        else:
-                            jobs_data.append(job_info)
-                
-                time.sleep(2)  # Be respectful
-                
-            except requests.RequestException as e:
-                print(f"Error fetching page {page + 1} from {self.__class__.__name__}: {e}")
-                continue
-        
-        if use_time_filter and filtered_count > 0:
-            print(f"Filtered out {filtered_count} jobs older than {hours_limit} hours from {self.__class__.__name__}")
-        
-        return jobs_data
-
-class LinkedInScraper(JobScraper):
-    """LinkedIn job scraper"""
-    
-    def build_search_url(self, search_term, location, page=0):
-        base_url = "https://www.linkedin.com/jobs/search"
-        # Add time filter parameter for LinkedIn (f_TPR=r86400 for 24 hours, r172800 for 48 hours)
-        return f"{base_url}?keywords={search_term}&location={location}&start={page * 25}&f_TPR=r172800"
-    
-    def extract_job_cards(self, soup):
-        job_cards = soup.find_all('div', class_='base-card')
-        if not job_cards:
-            job_cards = soup.find_all('div', class_='job-search-card')
-        return job_cards
-    
-    def extract_job_info(self, job_card):
-        try:
-            job_info = {}
-            
-            title_elem = job_card.find('h3', class_='base-search-card__title') or \
-                        job_card.find('a', class_='base-card__full-link')
-            job_info['title'] = title_elem.get_text(strip=True) if title_elem else 'N/A'
-            
-            company_elem = job_card.find('h4', class_='base-search-card__subtitle') or \
-                          job_card.find('a', class_='hidden-nested-link')
-            job_info['company'] = company_elem.get_text(strip=True) if company_elem else 'N/A'
-            
-            location_elem = job_card.find('span', class_='job-search-card__location')
-            job_info['location'] = location_elem.get_text(strip=True) if location_elem else 'N/A'
-            
-            link_elem = job_card.find('a', class_='base-card__full-link')
-            job_info['link'] = link_elem.get('href') if link_elem else 'N/A'
-            
-            date_elem = job_card.find('time', class_='job-search-card__listdate')
-            job_info['posted_date'] = date_elem.get_text(strip=True) if date_elem else 'N/A'
-            
-            return job_info
-        except Exception as e:
-            print(f"Error extracting LinkedIn job info: {e}")
-            return None
-
-class IndeedScraper(JobScraper):
-    """Indeed job scraper"""
-    
-    def build_search_url(self, search_term, location, page=0):
-        base_url = "https://www.indeed.com/jobs"
-        # Add fromage parameter for Indeed (1 for 1 day, 3 for 3 days, etc.)
-        return f"{base_url}?q={search_term}&l={location}&start={page * 10}&fromage=2"
-    
-    def extract_job_cards(self, soup):
-        return soup.find_all('div', class_='job_seen_beacon') or soup.find_all('div', class_='jobsearch-SerpJobCard')
-    
-    def extract_job_info(self, job_card):
-        try:
-            job_info = {}
-            
-            title_elem = job_card.find('h2', class_='jobTitle') or job_card.find('a', {'data-jk': True})
-            job_info['title'] = title_elem.get_text(strip=True) if title_elem else 'N/A'
-            
-            company_elem = job_card.find('span', class_='companyName') or job_card.find('a', class_='companyName')
-            job_info['company'] = company_elem.get_text(strip=True) if company_elem else 'N/A'
-            
-            location_elem = job_card.find('div', class_='companyLocation')
-            job_info['location'] = location_elem.get_text(strip=True) if location_elem else 'N/A'
-            
-            link_elem = job_card.find('h2', class_='jobTitle').find('a') if job_card.find('h2', class_='jobTitle') else None
-            job_info['link'] = f"https://www.indeed.com{link_elem.get('href')}" if link_elem else 'N/A'
-            
-            date_elem = job_card.find('span', class_='date')
-            job_info['posted_date'] = date_elem.get_text(strip=True) if date_elem else 'N/A'
-            
-            return job_info
-        except Exception as e:
-            print(f"Error extracting Indeed job info: {e}")
-            return None
-
-class GlassdoorScraper(JobScraper):
-    """Glassdoor job scraper"""
-    
-    def build_search_url(self, search_term, location, page=0):
-        base_url = "https://www.glassdoor.com/Job/jobs.htm"
-        return f"{base_url}?sc.keyword={search_term}&locT=C&locId=1&p={page + 1}"
-    
-    def extract_job_cards(self, soup):
-        return soup.find_all('li', class_='react-job-listing') or soup.find_all('div', class_='jobContainer')
-    
-    def extract_job_info(self, job_card):
-        try:
-            job_info = {}
-            
-            title_elem = job_card.find('a', class_='jobTitle')
-            job_info['title'] = title_elem.get_text(strip=True) if title_elem else 'N/A'
-            
-            company_elem = job_card.find('div', class_='employerName')
-            job_info['company'] = company_elem.get_text(strip=True) if company_elem else 'N/A'
-            
-            location_elem = job_card.find('div', class_='employerLocation')
-            job_info['location'] = location_elem.get_text(strip=True) if location_elem else 'N/A'
-            
-            link_elem = job_card.find('a', class_='jobTitle')
-            job_info['link'] = f"https://www.glassdoor.com{link_elem.get('href')}" if link_elem else 'N/A'
-            
-            job_info['posted_date'] = 'N/A'  # Glassdoor doesn't always show posting date
-            
-            return job_info
-        except Exception as e:
-            print(f"Error extracting Glassdoor job info: {e}")
-            return None
-
-class UniversalJobScraper:
-    """Universal job scraper that handles multiple job websites"""
-    
-    def __init__(self):
-        self.scrapers = {
-            'linkedin': LinkedInScraper(),
-            'indeed': IndeedScraper(),
-            'glassdoor': GlassdoorScraper(),
-        }
-    
-    def scrape_all_sites(self, search_term="", location="", num_pages=1, sites=None, 
-                        use_time_filter=False, hours_limit=36, 
-                        include_companies=None, exclude_companies=None,
-                        experience_levels=None):
-        """Scrape jobs from all specified sites with optional filtering"""
-        if sites is None:
-            sites = list(self.scrapers.keys())
-        
-        all_jobs = []
-        
-        for site in sites:
-            if site in self.scrapers:
-                print(f"\nScraping {site.title()}...")
-                if use_time_filter:
-                    print(f"Filtering for jobs posted within last {hours_limit} hours...")
-                jobs = self.scrapers[site].scrape_jobs(search_term, location, num_pages, use_time_filter, hours_limit)
-                all_jobs.extend(jobs)
-            else:
-                print(f"Scraper for {site} not available")
-        
-        # Apply company filters
-        if include_companies or exclude_companies:
-            original_count = len(all_jobs)
-            all_jobs = filter_by_company(all_jobs, include_companies, exclude_companies)
-            filtered_count = original_count - len(all_jobs)
-            
-            if include_companies:
-                print(f"\nFiltered to include only companies: {', '.join(include_companies)}")
-            if exclude_companies:
-                print(f"Excluded companies: {', '.join(exclude_companies)}")
-            if filtered_count > 0:
-                print(f"Filtered out {filtered_count} jobs based on company criteria")
-        
-        # Apply experience level filters
-        if experience_levels:
-            original_count = len(all_jobs)
-            all_jobs = filter_by_experience(all_jobs, experience_levels)
-            filtered_count = original_count - len(all_jobs)
-            
-            experience_labels = {
-                'entry': 'Entry Level',
-                'mid': 'Mid Level', 
-                'senior': 'Senior Level'
-            }
-            level_names = [experience_labels.get(level, level) for level in experience_levels]
-            print(f"\nFiltered for experience levels: {', '.join(level_names)}")
-            if filtered_count > 0:
-                print(f"Filtered out {filtered_count} jobs based on experience criteria")
-        else:
-            # Still detect experience levels for display
-            for job in all_jobs:
-                job['experience_level'] = detect_experience_level(job.get('title', ''), job.get('company', ''))
-        
-        return all_jobs
-    
-    def get_available_sites(self):
-        """Get list of available job sites"""
-        return list(self.scrapers.keys())
-
-def save_jobs_to_file(jobs_data, filename='universal_jobs.json'):
-    """Save jobs data to a JSON file"""
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(jobs_data, f, indent=2, ensure_ascii=False)
-    print(f"Saved {len(jobs_data)} jobs to {filename}")
-
-def display_jobs_summary(jobs):
-    """Display summary of scraped jobs"""
+def display_sample_jobs(jobs: List[Dict], max_display: int = 5):
+    """Display sample job results"""
     if not jobs:
-        print("No jobs found.")
+        print("No jobs to display")
         return
     
-    # Group by source
-    sources = {}
-    for job in jobs:
-        source = job.get('source', 'Unknown')
-        sources[source] = sources.get(source, 0) + 1
+    print(f"\n📋 Sample Jobs (showing {min(len(jobs), max_display)} of {len(jobs)}):")
+    print("=" * 80)
     
-    # Group by experience level
-    experience_levels = {}
-    for job in jobs:
-        level = job.get('experience_level', 'Unknown')
-        experience_levels[level] = experience_levels.get(level, 0) + 1
-    
-    print(f"\nFound {len(jobs)} total jobs:")
-    for source, count in sources.items():
-        print(f"  {source}: {count} jobs")
-    
-    print(f"\nBy experience level:")
-    experience_labels = {
-        'entry': 'Entry Level',
-        'mid': 'Mid Level',
-        'senior': 'Senior Level'
-    }
-    for level, count in experience_levels.items():
-        level_name = experience_labels.get(level, level.title())
-        print(f"  {level_name}: {count} jobs")
-    
-    print("\nFirst 10 jobs:")
-    print("-" * 80)
-    
-    for i, job in enumerate(jobs[:10], 1):
-        level_name = experience_labels.get(job.get('experience_level', ''), 'Unknown')
-        print(f"{i}. {job['title']}")
-        print(f"   Company: {job['company']}")
-        print(f"   Location: {job['location']}")
-        print(f"   Experience: {level_name}")
-        print(f"   Source: {job.get('source', 'Unknown')}")
-        print(f"   Posted: {job['posted_date']}")
-        print(f"   Link: {job['link']}")
-        print()
+    for i, job in enumerate(jobs[:max_display], 1):
+        title = job.get('title', 'N/A')
+        company = job.get('company', 'N/A')
+        location = job.get('location', 'N/A')
+        source = job.get('source', 'N/A')
+        salary = job.get('salary', '')
+        posted_date = job.get('posted_date', '')
+        
+        print(f"{i}. {title}")
+        print(f"   🏢 {company}")
+        print(f"   📍 {location}")
+        print(f"   🌐 Source: {source}")
+        
+        if salary:
+            print(f"   💰 {salary}")
+        if posted_date:
+            print(f"   📅 Posted: {posted_date}")
+        
+        if job.get('url'):
+            print(f"   🔗 {job['url']}")
+        
+        print("-" * 80)
+
 
 def main():
-    print("Universal Job Scraper")
-    print("=" * 30)
+    """Main function to orchestrate job scraping"""
+    parser = argparse.ArgumentParser(
+        description='Job Scraper - Multi-platform job aggregator',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 main.py                                    # Run with default config
+  python3 main.py --test --verbose                   # Quick test run
+  python3 main.py --search "Python Developer"        # Override search term
+  python3 main.py --location "Remote"                # Override location
+  python3 main.py --scrapers linkedin indeed         # Use specific scrapers
+  python3 main.py --output "my_jobs.csv"            # Custom output file
+  python3 main.py --no-email                        # Disable email
+        """
+    )
     
-    scraper = UniversalJobScraper()
-    available_sites = scraper.get_available_sites()
+    parser.add_argument('--config', '-c', default='configs/settings.yaml', 
+                       help='Path to configuration file')
+    parser.add_argument('--search', '-s', help='Search term override')
+    parser.add_argument('--location', '-l', help='Location override')
+    parser.add_argument('--pages', '-p', type=int, help='Pages per source override')
+    parser.add_argument('--scrapers', nargs='+', help='Specific scrapers to use')
+    parser.add_argument('--output', '-o', help='Output file path')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Verbose logging')
+    parser.add_argument('--no-email', action='store_true', help='Disable email sending')
+    parser.add_argument('--test', action='store_true', help='Run in test mode (minimal scraping)')
+    parser.add_argument('--show-config', action='store_true', help='Show configuration and exit')
     
-    print(f"Available job sites: {', '.join(available_sites)}")
+    args = parser.parse_args()
     
-    # Get user input
-    search_term = input("Enter job search term (e.g., 'Python Developer'): ").strip()
-    location = input("Enter location (e.g., 'New York, NY'): ").strip()
+    # Ensure required directories exist
+    ensure_directories_exist()
     
-    # Time filter option
-    use_filter = input("Filter jobs posted within last 36 hours? (y/n): ").strip().lower() == 'y'
-    hours_limit = 36
+    # Load configuration
+    config = load_config(args.config)
     
-    if use_filter:
-        try:
-            custom_hours = input("Enter custom hours limit (default 36): ").strip()
-            if custom_hours:
-                hours_limit = max(1, min(int(custom_hours), 168))  # Limit between 1 hour and 1 week
-        except ValueError:
-            hours_limit = 36
+    if not validate_config(config):
+        print("❌ Configuration validation failed. Exiting.")
+        sys.exit(1)
     
-    # Company filter options
-    include_companies = None
-    exclude_companies = None
+    # Override config with command line arguments
+    if args.search:
+        config['search']['terms'] = [args.search]
+    if args.location:
+        config['search']['locations'] = [args.location]
+    if args.pages:
+        config['search']['pages_per_source'] = args.pages
+    if args.scrapers:
+        config['scrapers']['enabled'] = args.scrapers
+    if args.no_email:
+        config['email']['enabled'] = False
+    if args.test:
+        config['search']['pages_per_source'] = 1
+        config['scrapers']['enabled'] = config['scrapers']['enabled'][:2]  # Use only first 2 scrapers
+        print("🧪 Running in TEST MODE - limited scraping")
     
-    company_filter = input("Apply company filters? (y/n): ").strip().lower() == 'y'
+    # Setup logging
+    log_level = logging.DEBUG if args.verbose else getattr(logging, config['logging']['level'].upper())
+    logger = setup_logger("my_logger", level=log_level)
     
-    if company_filter:
-        print("\nCompany Filter Options:")
-        print("1. Include specific companies only")
-        print("2. Exclude specific companies")
-        print("3. Both include and exclude")
-        
-        filter_choice = input("Choose option (1-3): ").strip()
-        
-        if filter_choice in ['1', '3']:
-            include_input = input("Enter companies to INCLUDE (comma-separated): ").strip()
-            if include_input:
-                include_companies = [comp.strip() for comp in include_input.split(',') if comp.strip()]
-        
-        if filter_choice in ['2', '3']:
-            exclude_input = input("Enter companies to EXCLUDE (comma-separated): ").strip()
-            if exclude_input:
-                exclude_companies = [comp.strip() for comp in exclude_input.split(',') if comp.strip()]
+    # Display configuration
+    display_config_summary(config)
     
-    # Experience level filter
-    experience_levels = None
-    experience_filter = input("Filter by experience level? (y/n): ").strip().lower() == 'y'
+    if args.show_config:
+        print("\n🔧 Full Configuration:")
+        print(yaml.dump(config, default_flow_style=False, indent=2))
+        return
     
-    if experience_filter:
-        print("\nExperience Level Options:")
-        print("1. Entry Level (Junior, Trainee, Intern, Graduate)")
-        print("2. Mid Level (Regular, Intermediate, Specialist)")
-        print("3. Senior Level (Senior, Lead, Principal, Manager)")
-        print("4. Multiple levels")
-        
-        exp_choice = input("Choose option (1-4): ").strip()
-        
-        if exp_choice == '1':
-            experience_levels = ['entry']
-        elif exp_choice == '2':
-            experience_levels = ['mid']
-        elif exp_choice == '3':
-            experience_levels = ['senior']
-        elif exp_choice == '4':
-            exp_input = input("Enter levels (entry,mid,senior - comma-separated): ").strip().lower()
-            if exp_input:
-                valid_levels = ['entry', 'mid', 'senior']
-                experience_levels = [level.strip() for level in exp_input.split(',') 
-                                   if level.strip() in valid_levels]
-    
-    # Site selection
-    print(f"\nSelect sites to scrape (comma-separated) or 'all' for all sites:")
-    print(f"Options: {', '.join(available_sites)}")
-    site_input = input("Sites: ").strip().lower()
-    
-    if site_input == 'all':
-        selected_sites = available_sites
-    else:
-        selected_sites = [s.strip() for s in site_input.split(',') if s.strip() in available_sites]
-    
-    if not selected_sites:
-        print("No valid sites selected. Using all sites.")
-        selected_sites = available_sites
+    print(f"\n🚀 Starting Job Scraper")
     
     try:
-        num_pages = int(input("Enter number of pages per site (1-3): ").strip())
-        num_pages = min(max(num_pages, 1), 3)  # Limit to 1-3 pages per site
-    except ValueError:
-        num_pages = 1
-    
-    # Build description of filters
-    filter_desc = []
-    if use_filter:
-        filter_desc.append(f"time: last {hours_limit} hours")
-    if include_companies:
-        filter_desc.append(f"include companies: {', '.join(include_companies)}")
-    if exclude_companies:
-        filter_desc.append(f"exclude companies: {', '.join(exclude_companies)}")
-    if experience_levels:
-        exp_labels = {'entry': 'Entry', 'mid': 'Mid', 'senior': 'Senior'}
-        exp_names = [exp_labels.get(level, level) for level in experience_levels]
-        filter_desc.append(f"experience: {', '.join(exp_names)}")
-    
-    filter_text = f" (filters: {'; '.join(filter_desc)})" if filter_desc else ""
-    print(f"\nScraping jobs for '{search_term}' in '{location}' from: {', '.join(selected_sites)}{filter_text}")
-    
-    # Scrape jobs
-    jobs = scraper.scrape_all_sites(search_term, location, num_pages, selected_sites, 
-                                   use_filter, hours_limit, include_companies, exclude_companies,
-                                   experience_levels)
-    
-    # Display results
-    display_jobs_summary(jobs)
-    
-    # Save to file
-    if jobs:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"jobs_{timestamp}.json"
-        save_jobs_to_file(jobs, filename)
-    else:
-        print("No jobs found. Try different search terms or adjust filters.")
+        # Initialize components
+        logger.info("Initializing scraper components...")
+        scraper_manager = ScraperManager(
+            max_workers=config['scrapers']['max_workers'],
+            default_delay=config['scrapers']['delay']
+        )
+        
+        job_filter = MainJobFilter()  # Changed from JobFilter() to MainJobFilter()
+        
+        # Validate scrapers
+        print("🔍 Validating scrapers...")
+        validation_results = scraper_manager.validate_scrapers()
+        
+        valid_scrapers = []
+        for name, status in validation_results.items():
+            if name in config['scrapers']['enabled']:
+                status_icon = "✅" if status else "❌"
+                print(f"  {status_icon} {name}")
+                if status:
+                    valid_scrapers.append(name)
+        
+        if not valid_scrapers:
+            print("❌ No valid scrapers available. Exiting.")
+            sys.exit(1)
+        
+        config['scrapers']['enabled'] = valid_scrapers
+        
+        # Scrape jobs
+        all_jobs = []
+        total_combinations = len(config['search']['terms']) * len(config['search']['locations'])
+        current_combination = 0
+        
+        print(f"\n🔄 Starting scraping process...")
+        start_time = datetime.now()
+        
+        for search_term in config['search']['terms']:
+            for location in config['search']['locations']:
+                current_combination += 1
+                print(f"\n📍 [{current_combination}/{total_combinations}] Scraping: '{search_term}' in '{location}'")
+                
+                jobs = scraper_manager.scrape_multiple_sources(
+                    scraper_names=config['scrapers']['enabled'],
+                    search_term=search_term,
+                    location=location,
+                    num_pages=config['search']['pages_per_source'],
+                    parallel=config['scrapers']['parallel']
+                )
+                
+                if jobs:
+                    print(f"  Found {len(jobs)} jobs")
+                    all_jobs.extend(jobs)
+                else:
+                    print("  No jobs found")
+        
+        scraping_duration = (datetime.now() - start_time).total_seconds()
+        
+        # Display statistics
+        stats = scraper_manager.get_scraping_stats()
+        print(f"\n📊 Scraping Summary:")
+        print(f"  Total jobs found: {len(all_jobs)}")
+        print(f"  Jobs by source: {stats['jobs_by_source']}")
+        print(f"  Duration: {scraping_duration:.2f}s")
+        
+        if stats['failed_scrapers']:
+            print(f"  ⚠️  Failed scrapers: {stats['failed_scrapers']}")
+        
+        if not all_jobs:
+            print("❌ No jobs found. Try adjusting your search terms or locations.")
+            return
+        
+        # Filter and deduplicate jobs
+        print("\n🔧 Processing jobs...")
+        
+        # Apply filters
+        print("  Applying filters...")
+        filtered_jobs = job_filter.filter_jobs(all_jobs, config['filters'])  # This method exists in MainJobFilter
+        print(f"  After filtering: {len(filtered_jobs)} jobs")
+        
+        # Deduplicate
+        if not config['output']['include_duplicates']:
+            print("  Removing duplicates...")
+            unique_jobs = deduplicate_jobs(filtered_jobs)
+            print(f"  After deduplication: {len(unique_jobs)} jobs")
+            final_jobs = unique_jobs
+        else:
+            final_jobs = filtered_jobs
+        
+        if not final_jobs:
+            print("❌ No jobs remaining after filtering. Try adjusting your filter criteria.")
+            return
+        
+        # Sort jobs
+        sort_by = config['output'].get('sort_by', 'posted_date')
+        sort_order = config['output'].get('sort_order', 'desc')
+        
+        if sort_by and sort_by in ['title', 'company', 'location', 'posted_date', 'salary']:
+            reverse = (sort_order == 'desc')
+            final_jobs.sort(key=lambda x: x.get(sort_by, ''), reverse=reverse)
+        
+        # Export data
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        if args.output:
+            output_file = args.output
+        else:
+            filename_template = config['output']['filename']
+            output_file = filename_template.format(timestamp=timestamp)
+        
+        # Ensure output directory exists
+        output_path = Path(output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        print(f"\n💾 Exporting to {output_file}")
+        
+        exporter = ['CSVExporter', 'JSONExporter', 'ExcelExporter'][0]  # Default to CSVExporter
+        if config['output']['format'] == 'csv':
+            csvexporter = CSVExporter()
+        elif config['output']['format'] == 'json':
+            jsonexporter = JSONExporter()
+        elif config['output']['format'] == 'excel':
+            excelexporter = ExcelExporter()
+
+        try:
+            if config['output']['format'] == 'csv' or output_file.endswith('.csv'):
+                csvexporter.export(final_jobs, output_file)
+            elif config['output']['format'] == 'json' or output_file.endswith('.json'):
+                json_file = output_file.replace('.csv', '.json') if output_file.endswith('.csv') else output_file
+                jsonexporter.export(final_jobs, json_file)
+                output_file = json_file
+            elif config['output']['format'] == 'excel' or output_file.endswith('.xlsx'):
+                excel_file = output_file.replace('.csv', '.xlsx') if output_file.endswith('.csv') else output_file
+                excelexporter.export(final_jobs, excel_file)
+                output_file = excel_file
+            else:
+                # Default to CSV
+                csvexporter.export(final_jobs, output_file)
+
+            print(f"  ✅ Successfully exported {len(final_jobs)} jobs")
+            
+        except Exception as e:
+            print(f"  ❌ Export failed: {e}")
+            logger.error(f"Export failed: {e}")
+        
+        # Send email if enabled
+        if config['email']['enabled'] and not args.no_email:
+            print("\n📧 Sending email notification...")
+            print("  ❌ Email sending is not available (EmailSender not found).")
+            logger.warning("Email sending skipped: EmailSender not found.")
+        
+        # Display sample results
+        display_sample_jobs(final_jobs, max_display=5)
+        
+        print(f"\n✅ Job scraping completed successfully!")
+        print(f"📁 Results saved to: {output_file}")
+        print(f"📊 Total jobs: {len(final_jobs)}")
+        
+    except KeyboardInterrupt:
+        print("\n⏹️  Scraping interrupted by user")
+        logger.info("Scraping interrupted by user")
+        
+    except Exception as e:
+        print(f"\n❌ An error occurred: {e}")
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+
 
 if __name__ == "__main__":
     main()
