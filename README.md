@@ -205,18 +205,48 @@ system.export_jobs(jobs, 'excel')
 ## 📁 Project Structure
 
 ```
-recomender/
-├── main.py                     # Core scraping logic and base classes
-├── job_recommender.py          # Main application entry point
-├── recommendation_engine.py    # AI recommendation system
-├── email_sender.py            # Email functionality and data export
-├── config.py                  # Configuration settings
-├── requirements.txt           # Python dependencies
-├── user_preferences.json      # User settings (generated)
-└── scrapper_module/
-    ├── linkedin.py            # LinkedIn scraper
-    ├── indeed.py              # Indeed scraper
-    └── glassdoor.py           # Glassdoor scraper
+job_scraper_project/
+│
+├── scrapers/                         # All individual job portal scrapers go here
+│   ├── __init__.py
+│   ├── base_scraper.py               # Base class defining the scraper interface
+│   ├── linkedin_scraper.py
+│   ├── indeed_scraper.py
+│   ├── company_scraper.py
+│   └── ...                           # More scrapers for other portals
+│
+├── manager/
+│   ├── __init__.py
+│   └── scraper_manager.py            # Orchestrates and unifies all scrapers
+│
+├── filters/
+│   ├── __init__.py
+│   └── job_filter.py                 # Functions to filter/deduplicate jobs
+│
+├── utils/
+│   ├── __init__.py
+│   ├── emailer.py                    # Code for sending emails
+│   ├── csv_exporter.py               # Convert job data to CSV
+│   └── logger.py                     # Logging utilities
+│
+├── data/
+│   ├── jobs.csv                      # Output data (ignored in .gitignore)
+│   └── resumes/                      # Uploaded resumes (if implemented)
+│
+├── tests/                            # Unit and integration tests
+│   ├── __init__.py
+│   ├── test_linkedin_scraper.py
+│   ├── test_scraper_manager.py
+│   └── ...                           # More test files
+│
+├── configs/
+│   └── settings.yaml                 # Configurations (e.g. schedule, creds, keywords)
+│
+├── requirements.txt                  # Python dependencies
+├── main.py                           # Main entry point to launch the scraping process
+├── README.md                         # Project overview and usage
+└── .gitignore                        # Ignore data, credentials, etc.
+
 ```
 
 ## 🤖 Automation
