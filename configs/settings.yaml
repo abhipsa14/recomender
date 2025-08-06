@@ -1,0 +1,85 @@
+# Job Scraper Configuration File
+
+# Search Parameters
+search:
+  terms:
+    - "Data Scientist"
+    - "AI Engineer"
+  locations:
+    - "India"
+    - "Remote"
+  pages_per_source: 2
+
+# Scraper Configuration
+scrapers:
+  enabled:
+    - linkedin
+    - indeed
+    - google
+    # - meta
+    # - microsoft
+  parallel: true
+  max_workers: 3
+  delay: 2.0
+
+# Filtering Criteria
+filters:
+  min_salary: null              # Minimum salary (e.g., 80000)
+  max_salary: null              # Maximum salary (e.g., 200000)
+  experience_levels:            # entry, mid, senior
+    - entry
+    - mid
+    - senior
+  exclude_companies: []         # Companies to avoid
+  include_companies: []         # Preferred companies (empty = all)
+  keywords:                     # Required keywords in job description
+    - python
+    - programming
+  exclude_keywords:             # Keywords to avoid
+    - sales
+    - marketing
+  max_age_days: 30             # Maximum job posting age in days
+  remote_only: false           # Only remote jobs
+  full_time_only: false        # Only full-time positions
+
+# Output Configuration
+output:
+  format: csv                   # csv, json, excel
+  filename: "jobs_{timestamp}.csv"
+  include_duplicates: false
+  sort_by: "posted_date"       # title, company, location, posted_date, salary
+  sort_order: "desc"           # asc, desc
+
+# Email Configuration
+email:
+  enabled: true
+  recipient: "your-email@gmail.com"
+  sender: "your-gmail@gmail.com"
+  sender_password: "your-app-password"
+  smtp_server: "smtp.gmail.com"
+  smtp_port: 587
+  subject_template: "Job Alert: {job_count} new jobs found"
+  include_attachments: true
+  max_jobs_in_email: 20
+
+# Logging Configuration
+logging:
+  level: INFO                   # DEBUG, INFO, WARNING, ERROR
+  file: "logs/scraper.log"
+  max_size_mb: 10
+  backup_count: 5
+
+# Rate Limiting
+rate_limiting:
+  requests_per_minute: 30
+  burst_limit: 10
+  respect_robots_txt: true
+
+# Advanced Settings
+advanced:
+  user_agents:
+    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    - "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+  timeout: 30
+  retry_attempts: 3
+  retry_delay: 5
